@@ -1,0 +1,339 @@
+name: RDP
+
+on:
+  workflow_dispatch:
+    inputs:
+      avast_url:
+        description: 'Direct download link for the Avast 4.8 installer (leave empty to skip)'
+        required: false
+        default: ''
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Configure RDP
+        shell: pwsh
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name fDenyTSConnections -Value 0 -Force
+          Get-NetFirewallRule -DisplayName "RDP-Tailscale" -ErrorAction SilentlyContinue | Remove-NetFirewallRule
+          New-NetFirewallRule -DisplayName "RDP-Tailscale" -Direction Inbound -Action Allow -Protocol TCP -LocalPort 3389 -RemoteAddress 100.64.0.0/10
+          Restart-Service -Name TermService -Force
+
+      - name: Set runneradmin password
+        shell: pwsh
+        run: |
+          secedit /export /cfg C:\secpol.cfg
+          (Get-Content C:\secpol.cfg) -replace 'PasswordComplexity = 1', 'PasswordComplexity = 0' | Set-Content C:\secpol.cfg
+          secedit /configure /db C:\Windows\security\local.sdb /cfg C:\secpol.cfg /areas SECURITYPOLICY
+          Remove-Item C:\secpol.cfg -Force
+
+          net user runneradmin "password"
+          net user runneradmin /active:yes
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "runneradmin" -ErrorAction SilentlyContinue
+
+      - name: Install Tailscale
+        shell: pwsh
+        run: |
+          $installer = Join-Path $env:TEMP "tailscale.msi"
+          Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi" -OutFile $installer
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installer`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installer -Force
+
+      - name: Connect to Tailscale
+        shell: pwsh
+        env:
+          TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          & $ts up --authkey="$env:TS_AUTHKEY" --hostname="gh-runner-$env:GITHUB_RUN_ID"
+
+          $tsIP = $null
+          for ($i = 0; $i -lt 10 -and -not $tsIP; $i++) {
+            $tsIP = (& $ts ip -4) 2>$null
+            if (-not $tsIP) { Start-Sleep -Seconds 5 }
+          }
+          if (-not $tsIP) {
+            Write-Error "No Tailscale IP assigned"
+            exit 1
+          }
+          "TAILSCALE_IP=$tsIP" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Install AnyDesk
+        shell: pwsh
+        run: |
+          choco install anydesk -y --no-progress
+          $any = "${env:ProgramFiles(x86)}\AnyDesk\AnyDesk.exe"
+          if (-not (Test-Path $any)) { $any = "$env:ProgramFiles\AnyDesk\AnyDesk.exe" }
+
+          Start-Service AnyDesk -ErrorAction SilentlyContinue
+          Start-Sleep -Seconds 10
+
+          cmd /c "echo admin123| `"$any`" --set-password"
+
+          $id = $null
+          for ($i = 0; $i -lt 10 -and -not $id; $i++) {
+            $id = (& $any --get-id) 2>$null
+            if (-not $id) { Start-Sleep -Seconds 5 }
+          }
+          if (-not $id) { Write-Warning "Could not read AnyDesk ID" }
+          "ANYDESK_ID=$id" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Install Remote Utilities Host
+        shell: pwsh
+        run: |
+          $msi = Join-Path $env:TEMP "host.msi"
+          Invoke-WebRequest -Uri "https://www.remoteutilities.com/download/host-7.8.4.0.msi" -OutFile $msi
+
+          $expected = "41d3da0b9922066ef03c1b01a7d92230d6823a2576e12a78b1b2fc69c7f15359"
+          $actual = (Get-FileHash $msi -Algorithm SHA256).Hash.ToLower()
+          if ($actual -ne $expected) { Write-Warning "Checksum mismatch: $actual" }
+
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$msi`"", "/qn", "/norestart" -Wait
+          Remove-Item $msi -Force
+          Start-Sleep -Seconds 20
+
+          $ruId = $null
+          foreach ($root in "HKLM:\SOFTWARE\Usoris", "HKLM:\SOFTWARE\WOW6432Node\Usoris") {
+            if (-not (Test-Path $root)) { continue }
+            Get-ChildItem $root -Recurse -ErrorAction SilentlyContinue | ForEach-Object {
+              $props = Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue
+              foreach ($n in $props.PSObject.Properties.Name) {
+                if ($n -match 'Internet.?ID') {
+                  Write-Host "Found $n in $($_.Name)"
+                  if (-not $ruId) { $ruId = $props.$n }
+                }
+              }
+            }
+          }
+          if (-not $ruId) { $ruId = "not found - open Remote Utilities Host on the desktop to read it" }
+          "RU_ID=$ruId" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Verify RDP port
+        shell: pwsh
+        run: |
+          $r = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          if (-not $r.TcpTestSucceeded) {
+            Write-Error "Port 3389 unreachable"
+            exit 1
+          }
+          Write-Host "RDP port is reachable"
+
+      - name: Show login details
+        shell: pwsh
+        run: |
+          Write-Host ""
+          Write-Host "=== RDP ACCESS (Tailscale) ==="
+          Write-Host "Address:  $env:TAILSCALE_IP"
+          Write-Host "Username: runneradmin"
+          Write-Host "Password: password"
+          Write-Host ""
+          Write-Host "=== ANYDESK ==="
+          Write-Host "ID:       $env:ANYDESK_ID"
+          Write-Host "Password: admin123"
+          Write-Host ""
+          Write-Host "=== REMOTE UTILITIES ==="
+          Write-Host "ID:       $env:RU_ID"
+          Write-Host "Password: RuXUh44_44 (set it in Host settings)"
+          Write-Host "=============================="
+
+      - name: Funny desktop shortcuts
+        shell: pwsh
+        run: |
+          $desk = "C:\Users\Public\Desktop"
+          New-Item -ItemType Directory -Path $desk -Force | Out-Null
+          $links = @{
+            "Welcome to Zombo"      = "https://www.zombo.com"
+            "Pointer Pointer"       = "https://pointerpointer.com"
+            "Hacker Typer"          = "https://hackertyper.net"
+            "The Useless Web"       = "https://theuselessweb.com"
+            "Windows 93"            = "https://www.windows93.net"
+            "Cat Bounce"            = "https://cat-bounce.com"
+            "Neal Fun"              = "https://neal.fun"
+          }
+          foreach ($name in $links.Keys) {
+            Set-Content -Path "$desk\$name.url" -Value "[InternetShortcut]`r`nURL=$($links[$name])"
+          }
+          Set-Content -Path "$desk\READ ME.txt" -Value "Congratulations! You are the 1,000,000th visitor of this computer.`r`nDo NOT turn off your computer. Clippy is watching."
+
+      - name: Move installs to D drive
+        shell: pwsh
+        run: |
+          Get-PSDrive -PSProvider FileSystem | Format-Table Name, @{n='FreeGB';e={[math]::Round($_.Free/1GB,1)}}, @{n='UsedGB';e={[math]::Round($_.Used/1GB,1)}}
+
+          New-Item -ItemType Directory -Path "D:\Program Files", "D:\Program Files (x86)", "D:\temp", "D:\choco-cache" -Force | Out-Null
+
+          $k64 = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion'
+          $k32 = 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion'
+          Set-ItemProperty $k64 -Name ProgramFilesDir -Value 'D:\Program Files'
+          Set-ItemProperty $k64 -Name 'ProgramFilesDir (x86)' -Value 'D:\Program Files (x86)'
+          Set-ItemProperty $k64 -Name ProgramW6432Dir -Value 'D:\Program Files'
+          Set-ItemProperty $k32 -Name ProgramFilesDir -Value 'D:\Program Files (x86)'
+          Set-ItemProperty $k32 -Name 'ProgramFilesDir (x86)' -Value 'D:\Program Files (x86)'
+          Set-ItemProperty $k32 -Name ProgramW6432Dir -Value 'D:\Program Files'
+
+          choco config set cacheLocation D:\choco-cache
+
+      - name: Install 2000s apps
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+
+          $env:TEMP = "D:\temp"; $env:TMP = "D:\temp"
+          $env:ProgramFiles = "D:\Program Files"
+          ${env:ProgramFiles(x86)} = "D:\Program Files (x86)"
+          $env:ProgramW6432 = "D:\Program Files"
+
+          function Clean-Up {
+            foreach ($p in "D:\choco-cache", "D:\temp") {
+              if (Test-Path $p) {
+                Get-ChildItem $p -Force -ErrorAction SilentlyContinue | ForEach-Object {
+                  try { cmd /c "rd /s /q `"$($_.FullName)`" 2>nul & del /f /q `"$($_.FullName)`" 2>nul" | Out-Null } catch {}
+                }
+              }
+            }
+            $global:LASTEXITCODE = 0
+          }
+
+          $apps = @(
+            "open-shell",
+            # Media
+            "winamp", "mpc-hc", "k-litecodecpack-standard", "quicktime", "foobar2000", "aimp",
+            # Chat and internet
+            "pidgin", "firefox", "filezilla", "putty",
+            # Tools
+            "winrar", "7zip", "irfanview", "xnview", "cdburnerxp", "infrarecorder",
+            "ccleaner", "notepadplusplus", "audacity", "gimp",
+            # Games and fun
+            "dosbox", "scummvm", "openttd", "rainmeter"
+          )
+
+          $total = $apps.Count
+          $i = 0
+          foreach ($app in $apps) {
+            $i++
+            $freeD = (Get-PSDrive D).Free / 1GB
+            $freeC = (Get-PSDrive C).Free / 1GB
+            if ($freeD -lt 3 -or $freeC -lt 2) {
+              Write-Warning ("Low space (D: {0:N1} GB, C: {1:N1} GB), stopping at [{2}/{3}]" -f $freeD, $freeC, $i, $total)
+              break
+            }
+            Write-Host ("=== [{0}/{1}] Installing {2} (D: {3:N0} GB free, C: {4:N0} GB free) ===" -f $i, $total, $app, $freeD, $freeC)
+            try {
+              choco install $app -y --no-progress --limit-output
+              if ($LASTEXITCODE -ne 0) { Write-Warning "$app failed, continuing" }
+            } catch {
+              Write-Warning "$app threw an error, continuing"
+            }
+            Clean-Up
+          }
+          Write-Host "Finished installing apps"
+          exit 0
+
+      - name: Make it look like Windows 7
+        shell: pwsh
+        run: |
+          # ---------- Wallpaper: blue light-rays style, drawn from scratch ----------
+          Add-Type -AssemblyName System.Drawing
+          $w = 1920; $h = 1080
+          $bmp = New-Object System.Drawing.Bitmap $w, $h
+          $g = [System.Drawing.Graphics]::FromImage($bmp)
+          $g.SmoothingMode = 'AntiAlias'
+
+          $rect = New-Object System.Drawing.Rectangle 0, 0, $w, $h
+          $bg = New-Object System.Drawing.Drawing2D.LinearGradientBrush($rect, [System.Drawing.Color]::FromArgb(6,30,100), [System.Drawing.Color]::FromArgb(70,165,235), 35.0)
+          $g.FillRectangle($bg, $rect)
+
+          # Light beams fanning out from the bottom left
+          $ox = [single]($w * 0.28); $oy = [single]($h * 1.15)
+          $beams = @(@(-200,60), @(100,260), @(380,520), @(640,760), @(900,1040), @(1180,1330), @(1480,1620), @(1760,2000), @(2050,2400))
+          $k = 0
+          foreach ($b in $beams) {
+            $alpha = 28 + (($k % 3) * 14)
+            $brush = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb($alpha, 255, 255, 255))
+            $pts = [System.Drawing.PointF[]]@(
+              (New-Object System.Drawing.PointF($ox, $oy)),
+              (New-Object System.Drawing.PointF([single]$b[0], [single]-80)),
+              (New-Object System.Drawing.PointF([single]$b[1], [single]-80))
+            )
+            $g.FillPolygon($brush, $pts)
+            $k++
+          }
+
+          # Soft glow on the left
+          $gp = New-Object System.Drawing.Drawing2D.GraphicsPath
+          $gp.AddEllipse(-300, 250, 1500, 1100)
+          $pg = New-Object System.Drawing.Drawing2D.PathGradientBrush($gp)
+          $pg.CenterColor = [System.Drawing.Color]::FromArgb(130, 190, 235, 255)
+          $pg.SurroundColors = @([System.Drawing.Color]::FromArgb(0, 190, 235, 255))
+          $g.FillEllipse($pg, -300, 250, 1500, 1100)
+          $g.Dispose()
+
+          $file = "C:\Users\Public\Pictures\win7-style.png"
+          New-Item -ItemType Directory -Path (Split-Path $file) -Force | Out-Null
+          $bmp.Save($file, [System.Drawing.Imaging.ImageFormat]::Png)
+          $bmp.Dispose()
+
+          Set-ItemProperty 'HKCU:\Control Panel\Desktop' -Name Wallpaper -Value $file
+          Set-ItemProperty 'HKCU:\Control Panel\Desktop' -Name WallpaperStyle -Value '10'
+          Set-ItemProperty 'HKCU:\Control Panel\Desktop' -Name TileWallpaper -Value '0'
+
+          # ---------- Light theme, blue glass-style window colour ----------
+          $pers = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize'
+          New-Item -Path $pers -Force | Out-Null
+          Set-ItemProperty $pers -Name AppsUseLightTheme -Value 1 -Type DWord
+          Set-ItemProperty $pers -Name SystemUsesLightTheme -Value 1 -Type DWord
+          Set-ItemProperty $pers -Name EnableTransparency -Value 1 -Type DWord
+          Set-ItemProperty $pers -Name ColorPrevalence -Value 1 -Type DWord
+          reg add "HKCU\Software\Microsoft\Windows\DWM" /v ColorPrevalence /t REG_DWORD /d 1 /f | Out-Null
+          reg add "HKCU\Software\Microsoft\Windows\DWM" /v AccentColor /t REG_DWORD /d 4292646477 /f | Out-Null
+
+          # ---------- Taskbar: left aligned, no search box or task view ----------
+          $adv = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced'
+          New-Item -Path $adv -Force | Out-Null
+          Set-ItemProperty $adv -Name TaskbarAl -Value 0 -Type DWord
+          Set-ItemProperty $adv -Name ShowTaskViewButton -Value 0 -Type DWord
+          Set-ItemProperty $adv -Name TaskbarDa -Value 0 -Type DWord
+          Set-ItemProperty $adv -Name TaskbarMn -Value 0 -Type DWord
+          $srch = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Search'
+          New-Item -Path $srch -Force | Out-Null
+          Set-ItemProperty $srch -Name SearchboxTaskbarMode -Value 0 -Type DWord
+
+          # ---------- Classic desktop icons ----------
+          $icons = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\HideDesktopIcons\NewStartPanel'
+          New-Item -Path $icons -Force | Out-Null
+          foreach ($clsid in '{20D04FE0-3AEA-1069-A2D8-08002B30309D}', '{59031a47-3f72-44a7-89c5-5595fe6b30ee}', '{F02C1A0D-BE21-4350-88B0-7367FC96EF3C}', '{5399E694-6CE5-4D6C-8FCE-1D8870FDCBA0}', '{645FF040-5081-101B-9F08-00AA002F954E}') {
+            Set-ItemProperty $icons -Name $clsid -Value 0 -Type DWord
+          }
+
+          # ---------- Open-Shell: Windows 7 style Start menu (best effort) ----------
+          $os = 'HKCU:\Software\OpenShell\StartMenu\Settings'
+          New-Item -Path $os -Force | Out-Null
+          Set-ItemProperty $os -Name MenuStyle -Value 'Win7'
+          Set-ItemProperty $os -Name Skin1 -Value 'Windows Aero'
+          Set-ItemProperty $os -Name StartButtonType -Value 'AeroButton'
+
+          Write-Host "Windows 7 look applied"
+
+      - name: Avast 4.8 (optional)
+        if: ${{ github.event.inputs.avast_url != '' }}
+        continue-on-error: true
+        shell: pwsh
+        env:
+          AVAST_URL: ${{ github.event.inputs.avast_url }}
+        run: |
+          $dest = "C:\Users\Public\Desktop\Avast-4.8-setup.exe"
+          Invoke-WebRequest -Uri $env:AVAST_URL -OutFile $dest -UseBasicParsing
+          Get-FileHash $dest -Algorithm SHA256 | Format-List
+          Write-Host "Saved to the desktop. Trying a silent install, if it does nothing run it by hand."
+          Start-Process $dest -ArgumentList "/silent" -Wait -ErrorAction SilentlyContinue
+
+      - name: Keep alive
+        shell: pwsh
+        run: |
+          while ($true) {
+            Write-Host "[$(Get-Date)] Active - RDP $env:TAILSCALE_IP | AnyDesk $env:ANYDESK_ID | RU $env:RU_ID"
+            Start-Sleep -Seconds 300
+          }
