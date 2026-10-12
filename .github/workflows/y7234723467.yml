@@ -1,0 +1,234 @@
+name: RDP
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Configure RDP
+        shell: pwsh
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name fDenyTSConnections -Value 0 -Force
+          Get-NetFirewallRule -DisplayName "RDP-Tailscale" -ErrorAction SilentlyContinue | Remove-NetFirewallRule
+          New-NetFirewallRule -DisplayName "RDP-Tailscale" -Direction Inbound -Action Allow -Protocol TCP -LocalPort 3389 -RemoteAddress 100.64.0.0/10
+          Restart-Service -Name TermService -Force
+
+      - name: Create RDP user
+        shell: pwsh
+        run: |
+          secedit /export /cfg C:\secpol.cfg
+          (Get-Content C:\secpol.cfg) -replace 'PasswordComplexity = 1', 'PasswordComplexity = 0' | Set-Content C:\secpol.cfg
+          secedit /configure /db C:\Windows\security\local.sdb /cfg C:\secpol.cfg /areas SECURITYPOLICY
+          Remove-Item C:\secpol.cfg -Force
+
+          $securePass = ConvertTo-SecureString "password" -AsPlainText -Force
+          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+
+      - name: Install Tailscale
+        shell: pwsh
+        run: |
+          $installer = Join-Path $env:TEMP "tailscale.msi"
+          Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi" -OutFile $installer
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installer`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installer -Force
+
+      - name: Connect to Tailscale
+        shell: pwsh
+        env:
+          TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          & $ts up --authkey="$env:TS_AUTHKEY" --hostname="gh-runner-$env:GITHUB_RUN_ID"
+
+          $tsIP = $null
+          for ($i = 0; $i -lt 10 -and -not $tsIP; $i++) {
+            $tsIP = (& $ts ip -4) 2>$null
+            if (-not $tsIP) { Start-Sleep -Seconds 5 }
+          }
+          if (-not $tsIP) {
+            Write-Error "No Tailscale IP assigned"
+            exit 1
+          }
+          "TAILSCALE_IP=$tsIP" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Install AnyDesk
+        shell: pwsh
+        run: |
+          choco install anydesk -y --no-progress
+          $any = "${env:ProgramFiles(x86)}\AnyDesk\AnyDesk.exe"
+          if (-not (Test-Path $any)) { $any = "$env:ProgramFiles\AnyDesk\AnyDesk.exe" }
+
+          Start-Service AnyDesk -ErrorAction SilentlyContinue
+          Start-Sleep -Seconds 10
+
+          cmd /c "echo admin123| `"$any`" --set-password"
+
+          $id = $null
+          for ($i = 0; $i -lt 10 -and -not $id; $i++) {
+            $id = (& $any --get-id) 2>$null
+            if (-not $id) { Start-Sleep -Seconds 5 }
+          }
+          if (-not $id) { Write-Warning "Could not read AnyDesk ID" }
+          "ANYDESK_ID=$id" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Install Remote Utilities Host
+        shell: pwsh
+        run: |
+          $msi = Join-Path $env:TEMP "host.msi"
+          Invoke-WebRequest -Uri "https://www.remoteutilities.com/download/host-7.8.4.0.msi" -OutFile $msi
+
+          $expected = "41d3da0b9922066ef03c1b01a7d92230d6823a2576e12a78b1b2fc69c7f15359"
+          $actual = (Get-FileHash $msi -Algorithm SHA256).Hash.ToLower()
+          if ($actual -ne $expected) { Write-Warning "Checksum mismatch: $actual" }
+
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$msi`"", "/qn", "/norestart" -Wait
+          Remove-Item $msi -Force
+          Start-Sleep -Seconds 20
+
+          # Best effort: find the Internet ID in the registry
+          $ruId = $null
+          foreach ($root in "HKLM:\SOFTWARE\Usoris", "HKLM:\SOFTWARE\WOW6432Node\Usoris") {
+            if (-not (Test-Path $root)) { continue }
+            Get-ChildItem $root -Recurse -ErrorAction SilentlyContinue | ForEach-Object {
+              $props = Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue
+              foreach ($n in $props.PSObject.Properties.Name) {
+                if ($n -match 'Internet.?ID') {
+                  Write-Host "Found $n in $($_.Name)"
+                  if (-not $ruId) { $ruId = $props.$n }
+                }
+              }
+            }
+          }
+          if (-not $ruId) { $ruId = "not found - open Remote Utilities Host on the desktop to read it" }
+          "RU_ID=$ruId" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Verify RDP port
+        shell: pwsh
+        run: |
+          $r = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          if (-not $r.TcpTestSucceeded) {
+            Write-Error "Port 3389 unreachable"
+            exit 1
+          }
+          Write-Host "RDP port is reachable"
+
+      - name: Show login details
+        shell: pwsh
+        run: |
+          Write-Host ""
+          Write-Host "=== RDP ACCESS (Tailscale) ==="
+          Write-Host "Address:  $env:TAILSCALE_IP"
+          Write-Host "Username: RDP"
+          Write-Host "Password: password"
+          Write-Host ""
+          Write-Host "=== ANYDESK ==="
+          Write-Host "ID:       $env:ANYDESK_ID"
+          Write-Host "Password: admin123"
+          Write-Host ""
+          Write-Host "=== REMOTE UTILITIES ==="
+          Write-Host "ID:       $env:RU_ID"
+          Write-Host "Password: RuXUh44_44 (set it in Host settings, see notes)"
+          Write-Host "=============================="
+
+      - name: Move installs to D drive
+        shell: pwsh
+        run: |
+          Get-PSDrive -PSProvider FileSystem | Format-Table Name, @{n='FreeGB';e={[math]::Round($_.Free/1GB,1)}}, @{n='UsedGB';e={[math]::Round($_.Used/1GB,1)}}
+
+          New-Item -ItemType Directory -Path "D:\Program Files", "D:\Program Files (x86)", "D:\temp", "D:\choco-cache" -Force | Out-Null
+
+          # Point Windows and installers at D: for new programs
+          $k64 = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion'
+          $k32 = 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion'
+          Set-ItemProperty $k64 -Name ProgramFilesDir -Value 'D:\Program Files'
+          Set-ItemProperty $k64 -Name 'ProgramFilesDir (x86)' -Value 'D:\Program Files (x86)'
+          Set-ItemProperty $k64 -Name ProgramW6432Dir -Value 'D:\Program Files'
+          Set-ItemProperty $k32 -Name ProgramFilesDir -Value 'D:\Program Files (x86)'
+          Set-ItemProperty $k32 -Name 'ProgramFilesDir (x86)' -Value 'D:\Program Files (x86)'
+          Set-ItemProperty $k32 -Name ProgramW6432Dir -Value 'D:\Program Files'
+
+          choco config set cacheLocation D:\choco-cache
+
+      - name: Install 100+ apps
+        shell: pwsh
+        run: |
+          # Make this step and its installers use D: for temp files and Program Files
+          $env:TEMP = "D:\temp"; $env:TMP = "D:\temp"
+          $env:ProgramFiles = "D:\Program Files"
+          ${env:ProgramFiles(x86)} = "D:\Program Files (x86)"
+          $env:ProgramW6432 = "D:\Program Files"
+
+          $apps = @(
+            # Games and launchers
+            "steam-client", "epicgameslauncher", "goggalaxy", "ubisoft-connect",
+            "minecraft-launcher", "retroarch", "itch", "playnite",
+            "dolphin", "pcsx2", "ppsspp", "scummvm",
+            "openttd", "supertuxkart", "0ad", "godot",
+
+            # Music and video
+            "spotify", "vlc", "mpv", "kodi", "foobar2000", "musicbee",
+            "plex", "jellyfin-media-player", "handbrake", "ffmpeg",
+            "yt-dlp", "mp3tag", "calibre", "sumatrapdf", "itunes", "potplayer",
+
+            # Streaming
+            "obs-studio", "streamlabs-obs",
+
+            # Chat and email
+            "discord", "telegram", "whatsapp", "zoom", "slack",
+            "signal", "microsoft-teams", "element-desktop", "thunderbird", "skype",
+
+            # Creative
+            "blender", "gimp", "krita", "inkscape", "audacity", "paint.net",
+            "shotcut", "kdenlive", "openshot", "darktable", "rawtherapee",
+            "scribus", "libreoffice-fresh", "lmms", "musescore", "obsidian",
+
+            # Browsers
+            "googlechrome", "firefox", "brave", "opera", "vivaldi", "tor-browser",
+
+            # Dev tools
+            "vscode", "git", "python", "nodejs-lts", "notepadplusplus", "putty",
+            "winscp", "filezilla", "wireshark", "sysinternals", "postman",
+            "github-desktop", "golang", "openjdk", "jq", "cmake",
+            "sublimetext4", "windows-terminal", "powertoys",
+
+            # Utilities
+            "7zip", "winrar", "everything", "treesize-free", "windirstat",
+            "cpu-z", "gpu-z", "hwinfo", "crystaldiskinfo", "ccleaner",
+            "sharex", "greenshot", "autohotkey", "rufus", "etcher",
+            "bitwarden", "keepassxc", "malwarebytes", "teamviewer", "rustdesk",
+            "parsec", "irfanview", "xnview"
+          )
+
+          $total = $apps.Count
+          $i = 0
+          foreach ($app in $apps) {
+            $i++
+            $freeD = (Get-PSDrive D).Free / 1GB
+            $freeC = (Get-PSDrive C).Free / 1GB
+            if ($freeD -lt 3 -or $freeC -lt 2) {
+              Write-Warning ("Low space (D: {0:N1} GB, C: {1:N1} GB), stopping at [{2}/{3}]" -f $freeD, $freeC, $i, $total)
+              break
+            }
+            Write-Host ("=== [{0}/{1}] Installing {2} (D: {3:N0} GB free, C: {4:N0} GB free) ===" -f $i, $total, $app, $freeD, $freeC)
+            choco install $app -y --no-progress --limit-output
+            if ($LASTEXITCODE -ne 0) { Write-Warning "$app failed, continuing" }
+
+            Remove-Item D:\choco-cache\* -Recurse -Force -ErrorAction SilentlyContinue
+            Remove-Item D:\temp\* -Recurse -Force -ErrorAction SilentlyContinue
+          }
+          Write-Host "Finished installing apps"
+          exit 0
+
+      - name: Keep alive
+        shell: pwsh
+        run: |
+          while ($true) {
+            Write-Host "[$(Get-Date)] Active - RDP $env:TAILSCALE_IP | AnyDesk $env:ANYDESK_ID | RU $env:RU_ID"
+            Start-Sleep -Seconds 300
+          }
