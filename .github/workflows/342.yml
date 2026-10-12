@@ -1,0 +1,332 @@
+name: RDP
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Configure RDP
+        shell: pwsh
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name fDenyTSConnections -Value 0 -Force
+          Get-NetFirewallRule -DisplayName "RDP-Tailscale" -ErrorAction SilentlyContinue | Remove-NetFirewallRule
+          New-NetFirewallRule -DisplayName "RDP-Tailscale" -Direction Inbound -Action Allow -Protocol TCP -LocalPort 3389 -RemoteAddress 100.64.0.0/10
+          Restart-Service -Name TermService -Force
+
+      - name: Create RDP user
+        shell: pwsh
+        run: |
+          secedit /export /cfg C:\secpol.cfg
+          (Get-Content C:\secpol.cfg) -replace 'PasswordComplexity = 1', 'PasswordComplexity = 0' | Set-Content C:\secpol.cfg
+          secedit /configure /db C:\Windows\security\local.sdb /cfg C:\secpol.cfg /areas SECURITYPOLICY
+          Remove-Item C:\secpol.cfg -Force
+
+          net user runneradmin "password"
+          net user runneradmin /active:yes
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "runneradmin" -ErrorAction SilentlyContinue
+
+          $securePass = ConvertTo-SecureString "password" -AsPlainText -Force
+          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+
+      - name: Install Tailscale
+        shell: pwsh
+        run: |
+          $installer = Join-Path $env:TEMP "tailscale.msi"
+          Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi" -OutFile $installer
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installer`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installer -Force
+
+      - name: Connect to Tailscale
+        shell: pwsh
+        env:
+          TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          & $ts up --authkey="$env:TS_AUTHKEY" --hostname="gh-runner-$env:GITHUB_RUN_ID"
+
+          $tsIP = $null
+          for ($i = 0; $i -lt 10 -and -not $tsIP; $i++) {
+            $tsIP = (& $ts ip -4) 2>$null
+            if (-not $tsIP) { Start-Sleep -Seconds 5 }
+          }
+          if (-not $tsIP) {
+            Write-Error "No Tailscale IP assigned"
+            exit 1
+          }
+          "TAILSCALE_IP=$tsIP" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Install AnyDesk
+        shell: pwsh
+        run: |
+          choco install anydesk -y --no-progress
+          $any = "${env:ProgramFiles(x86)}\AnyDesk\AnyDesk.exe"
+          if (-not (Test-Path $any)) { $any = "$env:ProgramFiles\AnyDesk\AnyDesk.exe" }
+
+          Start-Service AnyDesk -ErrorAction SilentlyContinue
+          Start-Sleep -Seconds 10
+
+          cmd /c "echo admin123| `"$any`" --set-password"
+
+          $id = $null
+          for ($i = 0; $i -lt 10 -and -not $id; $i++) {
+            $id = (& $any --get-id) 2>$null
+            if (-not $id) { Start-Sleep -Seconds 5 }
+          }
+          if (-not $id) { Write-Warning "Could not read AnyDesk ID" }
+          "ANYDESK_ID=$id" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Install Remote Utilities Host
+        shell: pwsh
+        run: |
+          $msi = Join-Path $env:TEMP "host.msi"
+          Invoke-WebRequest -Uri "https://www.remoteutilities.com/download/host-7.8.4.0.msi" -OutFile $msi
+
+          $expected = "41d3da0b9922066ef03c1b01a7d92230d6823a2576e12a78b1b2fc69c7f15359"
+          $actual = (Get-FileHash $msi -Algorithm SHA256).Hash.ToLower()
+          if ($actual -ne $expected) { Write-Warning "Checksum mismatch: $actual" }
+
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$msi`"", "/qn", "/norestart" -Wait
+          Remove-Item $msi -Force
+          Start-Sleep -Seconds 20
+
+          $ruId = $null
+          foreach ($root in "HKLM:\SOFTWARE\Usoris", "HKLM:\SOFTWARE\WOW6432Node\Usoris") {
+            if (-not (Test-Path $root)) { continue }
+            Get-ChildItem $root -Recurse -ErrorAction SilentlyContinue | ForEach-Object {
+              $props = Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue
+              foreach ($n in $props.PSObject.Properties.Name) {
+                if ($n -match 'Internet.?ID') {
+                  Write-Host "Found $n in $($_.Name)"
+                  if (-not $ruId) { $ruId = $props.$n }
+                }
+              }
+            }
+          }
+          if (-not $ruId) { $ruId = "not found - open Remote Utilities Host on the desktop to read it" }
+          "RU_ID=$ruId" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Verify RDP port
+        shell: pwsh
+        run: |
+          $r = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          if (-not $r.TcpTestSucceeded) {
+            Write-Error "Port 3389 unreachable"
+            exit 1
+          }
+          Write-Host "RDP port is reachable"
+
+      - name: Show login details
+        shell: pwsh
+        run: |
+          Write-Host ""
+          Write-Host "=== RDP ACCESS (Tailscale) ==="
+          Write-Host "Address:  $env:TAILSCALE_IP"
+          Write-Host "Username: RDP         Password: password"
+          Write-Host "Username: runneradmin Password: password"
+          Write-Host ""
+          Write-Host "=== ANYDESK ==="
+          Write-Host "ID:       $env:ANYDESK_ID"
+          Write-Host "Password: admin123"
+          Write-Host ""
+          Write-Host "=== REMOTE UTILITIES ==="
+          Write-Host "ID:       $env:RU_ID"
+          Write-Host "Password: RuXUh44_44 (set it in Host settings)"
+          Write-Host "=============================="
+
+      - name: Year 2000 wallpaper
+        shell: pwsh
+        run: |
+          Add-Type -AssemblyName System.Drawing
+          $w = 1920; $h = 1080
+          $bmp = New-Object System.Drawing.Bitmap $w, $h
+          $g = [System.Drawing.Graphics]::FromImage($bmp)
+          $g.SmoothingMode = 'AntiAlias'
+          $g.TextRenderingHint = 'AntiAlias'
+          $rnd = New-Object System.Random 2000
+
+          # Blue to silver gradient
+          $rect = New-Object System.Drawing.Rectangle 0, 0, $w, $h
+          $bg = New-Object System.Drawing.Drawing2D.LinearGradientBrush($rect, [System.Drawing.Color]::FromArgb(10,50,180), [System.Drawing.Color]::FromArgb(200,215,235), 60.0)
+          $g.FillRectangle($bg, $rect)
+
+          # Big swoosh
+          $swoosh = New-Object System.Drawing.Pen ([System.Drawing.Color]::FromArgb(90,255,255,255)), 40
+          $pts = [System.Drawing.Point[]]@(
+            (New-Object System.Drawing.Point(-50, 900)),
+            (New-Object System.Drawing.Point(500, 560)),
+            (New-Object System.Drawing.Point(1100, 640)),
+            (New-Object System.Drawing.Point(1970, 200))
+          )
+          $g.DrawCurve($swoosh, $pts, 0.6)
+          $swoosh2 = New-Object System.Drawing.Pen ([System.Drawing.Color]::FromArgb(60,120,200,255)), 18
+          $pts2 = [System.Drawing.Point[]]@(
+            (New-Object System.Drawing.Point(-50, 960)),
+            (New-Object System.Drawing.Point(520, 640)),
+            (New-Object System.Drawing.Point(1100, 720)),
+            (New-Object System.Drawing.Point(1970, 300))
+          )
+          $g.DrawCurve($swoosh2, $pts2, 0.6)
+
+          # Glossy bubbles
+          for ($i = 0; $i -lt 28; $i++) {
+            $r = $rnd.Next(30, 140)
+            $x = $rnd.Next(0, $w - $r)
+            $y = $rnd.Next(0, $h - $r)
+            $br = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(55,255,255,255))
+            $g.FillEllipse($br, $x, $y, $r, $r)
+            $edge = New-Object System.Drawing.Pen ([System.Drawing.Color]::FromArgb(110,255,255,255)), 2
+            $g.DrawEllipse($edge, $x, $y, $r, $r)
+            $shine = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(140,255,255,255))
+            $g.FillEllipse($shine, ($x + $r*0.18), ($y + $r*0.12), ($r*0.35), ($r*0.2))
+          }
+
+          # Four-point sparkle stars
+          for ($i = 0; $i -lt 40; $i++) {
+            $x = $rnd.Next(0, $w); $y = $rnd.Next(0, $h); $s = $rnd.Next(8, 26)
+            $star = New-Object System.Drawing.Pen ([System.Drawing.Color]::FromArgb(200,255,255,255)), 2
+            $g.DrawLine($star, ($x - $s), $y, ($x + $s), $y)
+            $g.DrawLine($star, $x, ($y - $s), $x, ($y + $s))
+          }
+
+          $center = New-Object System.Drawing.StringFormat
+          $center.Alignment = 'Center'
+          $center.LineAlignment = 'Center'
+
+          # Big 2000 with shadow
+          $big = New-Object System.Drawing.Font("Arial Black", 240, [System.Drawing.FontStyle]::Bold)
+          $shadow = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(110,0,20,90))
+          $g.DrawString("2000", $big, $shadow, ($w/2 + 8), ($h/2 - 70 + 8), $center)
+          $white = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(245,255,255,255))
+          $g.DrawString("2000", $big, $white, ($w/2), ($h/2 - 70), $center)
+
+          $sub = New-Object System.Drawing.Font("Verdana", 38, [System.Drawing.FontStyle]::Bold)
+          $navy = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(15,40,120))
+          $g.DrawString("Welcome to the new millennium", $sub, $navy, ($w/2), ($h/2 + 140), $center)
+          $g.Dispose()
+
+          $file = "C:\Users\Public\Pictures\year2000.png"
+          New-Item -ItemType Directory -Path (Split-Path $file) -Force | Out-Null
+          $bmp.Save($file, [System.Drawing.Imaging.ImageFormat]::Png)
+          $bmp.Dispose()
+
+          # runneradmin (current user)
+          Set-ItemProperty 'HKCU:\Control Panel\Desktop' -Name Wallpaper -Value $file
+          Set-ItemProperty 'HKCU:\Control Panel\Desktop' -Name WallpaperStyle -Value '10'
+          Set-ItemProperty 'HKCU:\Control Panel\Desktop' -Name TileWallpaper -Value '0'
+
+          # New accounts such as RDP get it from the default profile
+          try {
+            reg load HKU\DefUser C:\Users\Default\NTUSER.DAT | Out-Null
+            reg add "HKU\DefUser\Control Panel\Desktop" /v Wallpaper /t REG_SZ /d $file /f | Out-Null
+            reg add "HKU\DefUser\Control Panel\Desktop" /v WallpaperStyle /t REG_SZ /d 10 /f | Out-Null
+            reg add "HKU\DefUser\Control Panel\Desktop" /v TileWallpaper /t REG_SZ /d 0 /f | Out-Null
+            [gc]::Collect()
+            Start-Sleep -Seconds 2
+            reg unload HKU\DefUser | Out-Null
+          } catch { Write-Warning "Default profile wallpaper failed: $_" }
+
+          Write-Host "Wallpaper saved to $file"
+
+      - name: Funny desktop shortcuts
+        shell: pwsh
+        run: |
+          $desk = "C:\Users\Public\Desktop"
+          New-Item -ItemType Directory -Path $desk -Force | Out-Null
+          $links = @{
+            "Welcome to Zombo"      = "https://www.zombo.com"
+            "Pointer Pointer"       = "https://pointerpointer.com"
+            "Hacker Typer"          = "https://hackertyper.net"
+            "The Useless Web"       = "https://theuselessweb.com"
+            "Windows 93"            = "https://www.windows93.net"
+            "Cat Bounce"            = "https://cat-bounce.com"
+            "Neal Fun"              = "https://neal.fun"
+          }
+          foreach ($name in $links.Keys) {
+            Set-Content -Path "$desk\$name.url" -Value "[InternetShortcut]`r`nURL=$($links[$name])"
+          }
+          Set-Content -Path "$desk\READ ME.txt" -Value "Congratulations! You are the 1,000,000th visitor of this computer.`r`nDo NOT turn off your computer. Clippy is watching."
+
+      - name: Move installs to D drive
+        shell: pwsh
+        run: |
+          Get-PSDrive -PSProvider FileSystem | Format-Table Name, @{n='FreeGB';e={[math]::Round($_.Free/1GB,1)}}, @{n='UsedGB';e={[math]::Round($_.Used/1GB,1)}}
+
+          New-Item -ItemType Directory -Path "D:\Program Files", "D:\Program Files (x86)", "D:\temp", "D:\choco-cache" -Force | Out-Null
+
+          $k64 = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion'
+          $k32 = 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion'
+          Set-ItemProperty $k64 -Name ProgramFilesDir -Value 'D:\Program Files'
+          Set-ItemProperty $k64 -Name 'ProgramFilesDir (x86)' -Value 'D:\Program Files (x86)'
+          Set-ItemProperty $k64 -Name ProgramW6432Dir -Value 'D:\Program Files'
+          Set-ItemProperty $k32 -Name ProgramFilesDir -Value 'D:\Program Files (x86)'
+          Set-ItemProperty $k32 -Name 'ProgramFilesDir (x86)' -Value 'D:\Program Files (x86)'
+          Set-ItemProperty $k32 -Name ProgramW6432Dir -Value 'D:\Program Files'
+
+          choco config set cacheLocation D:\choco-cache
+
+      - name: Install 20 apps
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+
+          $env:TEMP = "D:\temp"; $env:TMP = "D:\temp"
+          $env:ProgramFiles = "D:\Program Files"
+          ${env:ProgramFiles(x86)} = "D:\Program Files (x86)"
+          $env:ProgramW6432 = "D:\Program Files"
+
+          function Clean-Up {
+            foreach ($p in "D:\choco-cache", "D:\temp") {
+              if (Test-Path $p) {
+                Get-ChildItem $p -Force -ErrorAction SilentlyContinue | ForEach-Object {
+                  try { cmd /c "rd /s /q `"$($_.FullName)`" 2>nul & del /f /q `"$($_.FullName)`" 2>nul" | Out-Null } catch {}
+                }
+              }
+            }
+            $global:LASTEXITCODE = 0
+          }
+
+          $apps = @(
+            # 2000s classics
+            "winamp", "open-shell", "mpc-hc", "pidgin", "foobar2000", "irfanview",
+            # Retro games and fun
+            "dosbox", "scummvm", "retroarch", "supertuxkart", "openttd", "rainmeter",
+            # Everyday
+            "googlechrome", "firefox", "vlc", "paint.net", "7zip", "notepadplusplus",
+            "vscode", "discord"
+          )
+
+          $total = $apps.Count
+          $i = 0
+          foreach ($app in $apps) {
+            $i++
+            $freeD = (Get-PSDrive D).Free / 1GB
+            $freeC = (Get-PSDrive C).Free / 1GB
+            if ($freeD -lt 3 -or $freeC -lt 2) {
+              Write-Warning ("Low space (D: {0:N1} GB, C: {1:N1} GB), stopping at [{2}/{3}]" -f $freeD, $freeC, $i, $total)
+              break
+            }
+            Write-Host ("=== [{0}/{1}] Installing {2} (D: {3:N0} GB free, C: {4:N0} GB free) ===" -f $i, $total, $app, $freeD, $freeC)
+            try {
+              choco install $app -y --no-progress --limit-output
+              if ($LASTEXITCODE -ne 0) { Write-Warning "$app failed, continuing" }
+            } catch {
+              Write-Warning "$app threw an error, continuing"
+            }
+            Clean-Up
+          }
+          Write-Host "Finished installing apps"
+          exit 0
+
+      - name: Keep alive
+        shell: pwsh
+        run: |
+          while ($true) {
+            Write-Host "[$(Get-Date)] Active - RDP $env:TAILSCALE_IP | AnyDesk $env:ANYDESK_ID | RU $env:RU_ID"
+            Start-Sleep -Seconds 300
+          }
