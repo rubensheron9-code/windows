@@ -1,0 +1,443 @@
+name: RDP
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Keep Program Files on C
+        shell: pwsh
+        run: |
+          $k64 = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion'
+          $k32 = 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion'
+          Set-ItemProperty $k64 -Name ProgramFilesDir -Value 'C:\Program Files'
+          Set-ItemProperty $k64 -Name 'ProgramFilesDir (x86)' -Value 'C:\Program Files (x86)'
+          Set-ItemProperty $k64 -Name ProgramW6432Dir -Value 'C:\Program Files'
+          Set-ItemProperty $k32 -Name ProgramFilesDir -Value 'C:\Program Files (x86)'
+          Set-ItemProperty $k32 -Name 'ProgramFilesDir (x86)' -Value 'C:\Program Files (x86)'
+          Set-ItemProperty $k32 -Name ProgramW6432Dir -Value 'C:\Program Files'
+
+      - name: Configure RDP
+        shell: pwsh
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name fDenyTSConnections -Value 0 -Force
+          Get-NetFirewallRule -DisplayName "RDP-Tailscale" -ErrorAction SilentlyContinue | Remove-NetFirewallRule
+          New-NetFirewallRule -DisplayName "RDP-Tailscale" -Direction Inbound -Action Allow -Protocol TCP -LocalPort 3389 -RemoteAddress 100.64.0.0/10
+          Restart-Service -Name TermService -Force
+
+      - name: Set runneradmin password
+        shell: pwsh
+        run: |
+          secedit /export /cfg C:\secpol.cfg
+          (Get-Content C:\secpol.cfg) -replace 'PasswordComplexity = 1', 'PasswordComplexity = 0' | Set-Content C:\secpol.cfg
+          secedit /configure /db C:\Windows\security\local.sdb /cfg C:\secpol.cfg /areas SECURITYPOLICY
+          Remove-Item C:\secpol.cfg -Force
+
+          net user runneradmin "password"
+          net user runneradmin /active:yes
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "runneradmin" -ErrorAction SilentlyContinue
+
+      - name: Install Tailscale
+        shell: pwsh
+        run: |
+          $installer = Join-Path $env:TEMP "tailscale.msi"
+          Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi" -OutFile $installer
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installer`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installer -Force
+
+      - name: Connect to Tailscale
+        shell: pwsh
+        env:
+          TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          & $ts up --authkey="$env:TS_AUTHKEY" --hostname="gh-runner-$env:GITHUB_RUN_ID"
+
+          $tsIP = $null
+          for ($i = 0; $i -lt 10 -and -not $tsIP; $i++) {
+            $tsIP = (& $ts ip -4) 2>$null
+            if (-not $tsIP) { Start-Sleep -Seconds 5 }
+          }
+          if (-not $tsIP) {
+            Write-Error "No Tailscale IP assigned"
+            exit 1
+          }
+          "TAILSCALE_IP=$tsIP" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Install AnyDesk
+        shell: pwsh
+        run: |
+          choco install anydesk -y --no-progress
+          $any = "${env:ProgramFiles(x86)}\AnyDesk\AnyDesk.exe"
+          if (-not (Test-Path $any)) { $any = "$env:ProgramFiles\AnyDesk\AnyDesk.exe" }
+
+          Start-Service AnyDesk -ErrorAction SilentlyContinue
+          Start-Sleep -Seconds 10
+
+          cmd /c "echo admin123| `"$any`" --set-password"
+
+          $id = $null
+          for ($i = 0; $i -lt 10 -and -not $id; $i++) {
+            $id = (& $any --get-id) 2>$null
+            if (-not $id) { Start-Sleep -Seconds 5 }
+          }
+          if (-not $id) { Write-Warning "Could not read AnyDesk ID" }
+          "ANYDESK_ID=$id" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Install Remote Utilities Host
+        shell: pwsh
+        run: |
+          $msi = Join-Path $env:TEMP "host.msi"
+          Invoke-WebRequest -Uri "https://www.remoteutilities.com/download/host-7.8.4.0.msi" -OutFile $msi
+
+          $expected = "41d3da0b9922066ef03c1b01a7d92230d6823a2576e12a78b1b2fc69c7f15359"
+          $actual = (Get-FileHash $msi -Algorithm SHA256).Hash.ToLower()
+          if ($actual -ne $expected) { Write-Warning "Checksum mismatch: $actual" }
+
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$msi`"", "/qn", "/norestart" -Wait
+          Remove-Item $msi -Force
+          Start-Sleep -Seconds 20
+
+          $ruId = $null
+          foreach ($root in "HKLM:\SOFTWARE\Usoris", "HKLM:\SOFTWARE\WOW6432Node\Usoris") {
+            if (-not (Test-Path $root)) { continue }
+            Get-ChildItem $root -Recurse -ErrorAction SilentlyContinue | ForEach-Object {
+              $props = Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue
+              foreach ($n in $props.PSObject.Properties.Name) {
+                if ($n -match 'Internet.?ID') {
+                  Write-Host "Found $n in $($_.Name)"
+                  if (-not $ruId) { $ruId = $props.$n }
+                }
+              }
+            }
+          }
+          if (-not $ruId) { $ruId = "not found - open Remote Utilities Host on the desktop to read it" }
+          "RU_ID=$ruId" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Verify RDP port
+        shell: pwsh
+        run: |
+          $r = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          if (-not $r.TcpTestSucceeded) {
+            Write-Error "Port 3389 unreachable"
+            exit 1
+          }
+          Write-Host "RDP port is reachable"
+
+      - name: Show login details
+        shell: pwsh
+        run: |
+          Write-Host ""
+          Write-Host "=== RDP ACCESS (Tailscale) ==="
+          Write-Host "Address:  $env:TAILSCALE_IP"
+          Write-Host "Username: runneradmin"
+          Write-Host "Password: password"
+          Write-Host ""
+          Write-Host "=== ANYDESK ==="
+          Write-Host "ID:       $env:ANYDESK_ID"
+          Write-Host "Password: admin123"
+          Write-Host ""
+          Write-Host "=== REMOTE UTILITIES ==="
+          Write-Host "ID:       $env:RU_ID"
+          Write-Host "Password: RuXUh44_44 (set it in Host settings)"
+          Write-Host "=============================="
+
+      - name: Funny desktop shortcuts
+        shell: pwsh
+        run: |
+          $desk = "C:\Users\Public\Desktop"
+          New-Item -ItemType Directory -Path $desk -Force | Out-Null
+          $links = @{
+            "Welcome to Zombo"  = "https://www.zombo.com"
+            "Pointer Pointer"   = "https://pointerpointer.com"
+            "Hacker Typer"      = "https://hackertyper.net"
+            "The Useless Web"   = "https://theuselessweb.com"
+            "Windows 93"        = "https://www.windows93.net"
+            "Cat Bounce"        = "https://cat-bounce.com"
+            "Neal Fun"          = "https://neal.fun"
+          }
+          foreach ($name in $links.Keys) {
+            Set-Content -Path "$desk\$name.url" -Value "[InternetShortcut]`r`nURL=$($links[$name])"
+          }
+          Set-Content -Path "$desk\READ ME.txt" -Value "Congratulations! You are the 1,000,000th visitor of this computer.`r`nDo NOT turn off your computer. Clippy is watching."
+
+      - name: Install 25 classic old apps
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+
+          $apps = @(
+            # Start menu and theme
+            "open-shell",
+            # Media and music
+            "winamp", "foobar2000", "mediamonkey", "vlc",
+            # Chat and internet
+            "pidgin", "utorrent", "thunderbird", "trillian", "mirc",
+            # Tools and compression
+            "winrar", "7zip", "irfanview", "xnview", "paint.net", "notepadplusplus",
+            # Burning and disc
+            "nero-burning-rom", "cddburnerxp",
+            # File managers and FTP
+            "totalcommander", "filezilla",
+            # Image and audio editing
+            "gimp", "audacity",
+            # Other utilities
+            "adobereader", "quicktime", "daemon-tools-lite"
+          )
+
+          $total = $apps.Count
+          $i = 0
+          foreach ($app in $apps) {
+            $i++
+            Write-Host ("=== [{0}/{1}] Installing {2} ===" -f $i, $total, $app)
+            try {
+              choco install $app -y --no-progress --limit-output
+              if ($LASTEXITCODE -ne 0) { Write-Warning "$app failed, continuing" }
+            } catch {
+              Write-Warning "$app threw an error, continuing"
+            }
+          }
+          Write-Host "Finished installing classic apps"
+          exit 0
+
+      - name: Install 15+ FUNNY old apps (Bonus!)
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+
+          Write-Host ""
+          Write-Host "╔════════════════════════════════════════════════════════════╗"
+          Write-Host "║           INSTALLING ICONIC FUNNY OLD APPS                ║"
+          Write-Host "╚════════════════════════════════════════════════════════════╝"
+          Write-Host ""
+
+          $funny = @(
+            "aim",                  # AOL Instant Messenger - PEAK NOSTALGIA (2000s chat icon)
+            "icq",                  # "I Seek You" - even OLDER than AIM (beep boop!)
+            "realplayer",           # CODEC INSTALLATION NIGHTMARE (infamous bloatware)
+            "kodi",                 # XBMC - old media center (Kodi is still going!)
+            "teamviewer",           # "Just use TeamViewer!" (omnipresent meme)
+            "handbrake",            # Video converter (old school encoding)
+            "obs-studio",           # Screen recording (to record all this chaos)
+            "mpc-be",               # Media Player Classic Black Edition (minimal retro)
+            "inkscape",             # Vector graphics (why do we need this?!)
+            "blender",              # 3D modeling (OVERKILL on a joke machine!)
+            "geeqie",               # Image viewer
+            "putty",                # SSH client (classic for geeks)
+            "autohotkey",           # Macro automation (the virus maker's tool!)
+            "wireshark",            # Network packet sniffer (spy on yourself!)
+            "everything"            # File search (faster than Windows search)
+          )
+
+          $total = $funny.Count
+          $i = 0
+          foreach ($app in $funny) {
+            $i++
+            Write-Host ("🤪 [{0}/{1}] Installing {2}..." -f $i, $total, $app)
+            try {
+              choco install $app -y --no-progress --limit-output
+              if ($LASTEXITCODE -ne 0) { Write-Warning "$app failed, lol" }
+            } catch {
+              Write-Warning "$app threw an error, YOLO"
+            }
+            Start-Sleep -Milliseconds 500
+          }
+          Write-Host ""
+          Write-Host "║ FUNNY APPS INSTALLED! (or attempted to 😂)"
+          Write-Host ""
+          exit 0
+
+      - name: Install old Google Chrome
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          Write-Host "Installing Chrome (Chromium ESR)"
+          choco install chromium -y --no-progress --limit-output
+          Write-Host "Chromium installed"
+
+      - name: Windows 7 wallpaper
+        shell: pwsh
+        run: |
+          Add-Type -AssemblyName System.Drawing
+          $w = 1920; $h = 1080
+          $bmp = New-Object System.Drawing.Bitmap $w, $h
+          $g = [System.Drawing.Graphics]::FromImage($bmp)
+          $g.SmoothingMode = 'AntiAlias'
+          $g.CompositingQuality = 'HighQuality'
+          $g.InterpolationMode = 'HighQualityBicubic'
+
+          # Deep navy to bright blue base
+          $rect = New-Object System.Drawing.Rectangle 0, 0, $w, $h
+          $bg = New-Object System.Drawing.Drawing2D.LinearGradientBrush($rect, [System.Drawing.Color]::FromArgb(3,14,52), [System.Drawing.Color]::FromArgb(35,120,210), 20.0)
+          $g.FillRectangle($bg, $rect)
+
+          # Big glowing centre
+          $gp = New-Object System.Drawing.Drawing2D.GraphicsPath
+          $gp.AddEllipse(250, -250, 1750, 1500)
+          $pg = New-Object System.Drawing.Drawing2D.PathGradientBrush($gp)
+          $pg.CenterColor = [System.Drawing.Color]::FromArgb(240, 125, 220, 255)
+          $pg.SurroundColors = @([System.Drawing.Color]::FromArgb(0, 20, 90, 190))
+          $g.FillPath($pg, $gp)
+
+          # Soft light ribbons
+          function Draw-Ribbon($pts, $strength) {
+            $widths = 120, 86, 58, 36, 20, 9, 3
+            $factors = 0.10, 0.14, 0.20, 0.30, 0.45, 0.70, 1.00
+            for ($n = 0; $n -lt $widths.Count; $n++) {
+              $alpha = [int][math]::Min(255, $strength * $factors[$n])
+              $pen = [System.Drawing.Pen]::new([System.Drawing.Color]::FromArgb($alpha, 205, 238, 255), [single]$widths[$n])
+              $pen.StartCap = 'Round'
+              $pen.EndCap = 'Round'
+              $g.DrawCurve($pen, $pts, 0.5)
+              $pen.Dispose()
+            }
+          }
+          function P($x, $y) { [System.Drawing.PointF]::new([single]$x, [single]$y) }
+
+          Draw-Ribbon ([System.Drawing.PointF[]]@((P -150 560), (P 450 420), (P 1000 470), (P 1600 230), (P 2100 110))) 150
+          Draw-Ribbon ([System.Drawing.PointF[]]@((P -150 820), (P 500 640), (P 1100 720), (P 1700 430), (P 2100 300))) 230
+          Draw-Ribbon ([System.Drawing.PointF[]]@((P -150 900), (P 600 790), (P 1200 870), (P 1800 610), (P 2100 520))) 170
+          Draw-Ribbon ([System.Drawing.PointF[]]@((P -150 1020), (P 700 940), (P 1300 1000), (P 1900 790), (P 2100 730))) 120
+
+          # Tiny glints
+          $rnd = New-Object System.Random 7
+          for ($i = 0; $i -lt 70; $i++) {
+            $x = $rnd.Next(0, $w); $y = $rnd.Next(0, $h); $r = $rnd.Next(2, 7)
+            $a = $rnd.Next(40, 140)
+            $b = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb($a, 255, 255, 255))
+            $g.FillEllipse($b, $x, $y, $r, $r)
+            $b.Dispose()
+          }
+
+          # Slight dark fade at the bottom
+          $fadeRect = New-Object System.Drawing.Rectangle 0, ($h - 200), $w, 200
+          $fade = New-Object System.Drawing.Drawing2D.LinearGradientBrush($fadeRect, [System.Drawing.Color]::FromArgb(0, 0, 20, 70), [System.Drawing.Color]::FromArgb(110, 0, 20, 70), 90.0)
+          $g.FillRectangle($fade, $fadeRect)
+
+          $g.Dispose()
+
+          $file = "C:\Users\Public\Pictures\win7-wallpaper.png"
+          New-Item -ItemType Directory -Path (Split-Path $file) -Force | Out-Null
+          $bmp.Save($file, [System.Drawing.Imaging.ImageFormat]::Png)
+          $bmp.Dispose()
+          Write-Host "Wallpaper saved to $file"
+
+      - name: Apply full Windows 7 theme
+        shell: pwsh
+        run: |
+          $wall = "C:\Users\Public\Pictures\win7-wallpaper.png"
+
+          function Set-Val($path, $name, $value, $type) {
+            if (-not (Test-Path $path)) { New-Item -Path $path -Force | Out-Null }
+            New-ItemProperty -Path $path -Name $name -Value $value -PropertyType $type -Force | Out-Null
+          }
+
+          # Apply Windows 7 Aero theme settings
+          Set-Val 'HKCU:\Control Panel\Desktop' Wallpaper $wall String
+          Set-Val 'HKCU:\Control Panel\Desktop' WallpaperStyle '10' String
+          Set-Val 'HKCU:\Control Panel\Desktop' TileWallpaper '0' String
+
+          # Windows 7 Aero blue color scheme
+          Set-Val 'HKCU:\Control Panel\Colors' ActiveTitle '180 200 220' String
+          Set-Val 'HKCU:\Control Panel\Colors' InactiveTitle '200 210 230' String
+          Set-Val 'HKCU:\Control Panel\Colors' TitleText '0 0 0' String
+          Set-Val 'HKCU:\Control Panel\Colors' InactiveTitleText '100 100 100' String
+          Set-Val 'HKCU:\Control Panel\Colors' Menu '230 230 230' String
+          Set-Val 'HKCU:\Control Panel\Colors' MenuText '0 0 0' String
+          Set-Val 'HKCU:\Control Panel\Colors' Window '255 255 255' String
+          Set-Val 'HKCU:\Control Panel\Colors' WindowText '0 0 0' String
+          Set-Val 'HKCU:\Control Panel\Colors' Highlight '0 120 215' String
+          Set-Val 'HKCU:\Control Panel\Colors' HighlightText '255 255 255' String
+
+          # Taskbar: classic Windows 7 style
+          Set-Val 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced' TaskbarAl 0 DWord
+          Set-Val 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced' ShowTaskViewButton 0 DWord
+          Set-Val 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced' TaskbarDa 0 DWord
+          Set-Val 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced' TaskbarMn 0 DWord
+          Set-Val 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced' HideFileExt 0 DWord
+          Set-Val 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced' ShowInfoTip 1 DWord
+          Set-Val 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Search' SearchboxTaskbarMode 0 DWord
+
+          # Classic desktop icons
+          $ids = '{20D04FE0-3AEA-1069-A2D8-08002B30309D}', '{59031a47-3f72-44a7-89c5-5595fe6b30ee}', '{F02C1A0D-BE21-4350-88B0-7367FC96EF3C}', '{5399E694-6CE5-4D6C-8FCE-1D8870FDCBA0}', '{645FF040-5081-101B-9F08-00AA002F954E}'
+          foreach ($k in 'NewStartPanel', 'ClassicStartMenu') {
+            foreach ($id in $ids) {
+              Set-Val "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\HideDesktopIcons\$k" $id 0 DWord
+            }
+          }
+
+          # Explorer: Windows 7 classic style
+          Set-Val 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer' ShellState (([byte[]](0xc4, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00)) | Format-Hex -Raw) Binary
+          Set-Val 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced' NavPaneExpandToCurrentFolder 1 DWord
+          Set-Val 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced' NavPaneShowAllFolders 0 DWord
+          Set-Val 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced' LaunchTo 1 DWord
+          Set-Val 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced' SeparateProcess 0 DWord
+
+          # Aero glass and transparency
+          Set-Val 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize' AppsUseLightTheme 0 DWord
+          Set-Val 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize' SystemUsesLightTheme 0 DWord
+          Set-Val 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize' EnableTransparency 1 DWord
+          Set-Val 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize' ColorPrevalence 1 DWord
+          Set-Val 'HKCU:\Software\Microsoft\Windows\DWM' ColorPrevalence 1 DWord
+          Set-Val 'HKCU:\Software\Microsoft\Windows\DWM' AccentColor 0xFF4B9FD8 DWord
+          Set-Val 'HKCU:\Software\Microsoft\Windows\DWM' EnableWindowColorization 1 DWord
+          Set-Val 'HKCU:\Software\Microsoft\Windows\DWM' AlwaysHibernateThumbnails 1 DWord
+
+          # Open-Shell: Windows 7 Start menu
+          Set-Val 'HKCU:\Software\OpenShell\StartMenu\Settings' MenuStyle 'Win7' String
+          Set-Val 'HKCU:\Software\OpenShell\StartMenu\Settings' Skin1 'Windows Aero' String
+          Set-Val 'HKCU:\Software\OpenShell\StartMenu\Settings' StartButtonType 'AeroButton' String
+          Set-Val 'HKCU:\Software\OpenShell\StartMenu\Settings' RecentMetroApps 0 DWord
+          Set-Val 'HKCU:\Software\OpenShell\StartMenu\Settings' RemoveMetroApps 1 DWord
+
+          # Start Open-Shell at logon
+          $exe = "C:\Program Files\Open-Shell\StartMenu.exe"
+          if (Test-Path $exe) {
+            Set-Val 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' OpenShellMenu ('"' + $exe + '" -startup') String
+          }
+
+          Write-Host "Windows 7 Aero theme applied"
+
+      - name: Avast 4.8
+        continue-on-error: true
+        shell: pwsh
+        env:
+          AVAST_URL: 'https://nyc3.digitaloceanspaces.com/oldversion-prod-storage/software/avast-free-antivirus-4-8-1195-setupeng.exe?response-content-disposition=attachment%3B%20filename%3D%22avast-free-antivirus-4-8-1195-setupeng.exe%22&X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=DO801JWH3FQEHLAQUWMN%2F20261012%2Fnyc3%2Fs3%2Faws4_request&X-Amz-Date=20261012T230252Z&X-Amz-Expires=129600&X-Amz-SignedHeaders=host&X-Amz-Signature=4fd6629f2831c56f765d5044dd7ca7205d819ac60b03a727a77b787410fc6914'
+        run: |
+          $dest = "C:\Users\Public\Desktop\Avast-4.8-setup.exe"
+          Invoke-WebRequest -Uri $env:AVAST_URL -OutFile $dest -UseBasicParsing
+          Get-FileHash $dest -Algorithm SHA256 | Format-List
+          Write-Host "Saved to the desktop as Avast-4.8-setup.exe"
+
+          # Compatibility mode XP SP3 and Win 7
+          $layers = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Layers'
+          if (-not (Test-Path $layers)) { New-Item -Path $layers -Force | Out-Null }
+
+          foreach ($mode in "WINXPSP3", "WIN7RTM") {
+            Write-Host "Trying compatibility mode $mode"
+            New-ItemProperty -Path $layers -Name $dest -Value "~ $mode RUNASADMIN" -PropertyType String -Force | Out-Null
+            $env:__COMPAT_LAYER = "$mode RUNASADMIN"
+
+            $p = Start-Process $dest -ArgumentList "/silent" -PassThru
+            if (-not $p.WaitForExit(240000)) {
+              Write-Warning "Still running after 4 minutes, you can finish it by hand"
+              break
+            }
+            Write-Host "Installer exited with code $($p.ExitCode)"
+            if ($p.ExitCode -eq 0) { break }
+          }
+
+          Write-Host "Installer is on the desktop if you need to run it manually"
+
+      - name: Keep alive
+        shell: pwsh
+        run: |
+          while ($true) {
+            Write-Host "[$(Get-Date)] Active - RDP $env:TAILSCALE_IP | AnyDesk $env:ANYDESK_ID | RU $env:RU_ID"
+            Start-Sleep -Seconds 300
+          }
